@@ -150,7 +150,7 @@ class BlackFN
             FakeAC.Start(fortnitePath, "FortniteLauncher.exe");
             Console.WriteLine("Fortnite Server is starting up...");
             Injector.Inject(process.Id, backendDll);
-            Thread.Sleep(30000);
+            Thread.Sleep(60000);
             Injector.Inject(process.Id, serverDll);
         }
         catch (Exception e)
