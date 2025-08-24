@@ -117,14 +117,6 @@ class BlackFN
             return;
         }
 
-        var rvProcesses = Process.GetProcessesByName("RvControlSvc");
-        if (rvProcesses.Length == 0)
-        {
-            Console.WriteLine("Radmin VPN is'nt open please open Radmin VPN and connect to our Network...");
-            StartMenu();
-            return;
-        }
-
         var lines = File.ReadAllLines(filePath);
         string email = lines[0];
         string password = lines[1];
