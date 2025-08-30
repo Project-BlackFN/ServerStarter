@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Utilities;
@@ -11,18 +14,24 @@ class BlackFN
     static string AppDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "BlackFN_Server");
     static string DllPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "dll");
     static List<int> runningInstances = new List<int>();
+    static Dictionary<int, string> instanceAccounts = new Dictionary<int, string>();
     static bool shouldMonitor = false;
     static CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
+    static HttpClient httpClient = new HttpClient();
 
     static void Main()
     {
+        Console.WriteLine("[DEBUG] Starting application...");
         Directory.CreateDirectory(AppDataPath);
         if (!CheckRequiredFiles())
         {
-            Console.WriteLine("a few dlls were not found please add them..");
+            Console.WriteLine("[DEBUG] Required DLLs missing.");
+            Console.WriteLine("A few DLLs were not found, please add them..");
             Console.ReadKey();
             return;
         }
+
+        Console.WriteLine("[DEBUG] All required files are present.");
         StartMenu();
     }
 
@@ -31,30 +40,14 @@ class BlackFN
         string backendDllPath = Path.Combine(DllPath, "Backend.dll");
         string serverDllPath = Path.Combine(DllPath, "server.dll");
 
-        if (!Directory.Exists(DllPath))
-        {
-            Console.WriteLine($"DLL-Ordner nicht gefunden: {DllPath}");
-            return false;
-        }
+        Console.WriteLine("[DEBUG] Checking DLLs in " + DllPath);
+
+        if (!Directory.Exists(DllPath)) return false;
 
         bool allFilesFound = true;
 
-        if (!File.Exists(backendDllPath))
-        {
-            Console.WriteLine($"Backend.dll was not found in: {backendDllPath}");
-            allFilesFound = false;
-        }
-
-        if (!File.Exists(serverDllPath))
-        {
-            Console.WriteLine($"server.dll was not found in: {serverDllPath}");
-            allFilesFound = false;
-        }
-
-        if (allFilesFound)
-        {
-            Console.WriteLine("All files found.");
-        }
+        if (!File.Exists(backendDllPath)) { allFilesFound = false; Console.WriteLine("[DEBUG] Backend.dll missing"); }
+        if (!File.Exists(serverDllPath)) { allFilesFound = false; Console.WriteLine("[DEBUG] server.dll missing"); }
 
         return allFilesFound;
     }
@@ -70,66 +63,215 @@ class BlackFN
 
         if (option == "1") Settings();
         else if (option == "2") StartFNServer();
-        else
-        {
-            Console.WriteLine("Please enter a valid number");
-            StartMenu();
-        }
+        else StartMenu();
     }
 
     static void StartFNServer()
     {
+        Console.WriteLine("[DEBUG] Starting FN Server...");
         string filePath = Path.Combine(AppDataPath, "blackfn_inf.txt");
         if (!File.Exists(filePath))
         {
+            Console.WriteLine("[DEBUG] Settings file not found.");
             Console.WriteLine("Settings not found! Please configure first.");
             StartMenu();
             return;
         }
 
-        int instanceCount;
-        while (true)
-        {
-            Console.Write("How many instances do you want to start? ");
-            string input = Console.ReadLine();
-            if (int.TryParse(input, out instanceCount) && instanceCount > 0 && instanceCount <= 25) // max. 25 but if u have a beefy Server u can do more
-                break;
-            Console.WriteLine("Please enter a valid number between 1 and 25");
-        }
+        string[] settings = File.ReadAllLines(filePath);
+        Console.WriteLine("[DEBUG] Loaded settings:");
+        for (int i = 0; i < settings.Length; i++)
+            Console.WriteLine($"[DEBUG] Line {i}: {settings[i]}");
 
-        Console.WriteLine($"Starting {instanceCount} instances...");
-        for (int i = 1; i <= instanceCount; i++)
+        shouldMonitor = true;
+
+        _ = MonitorScalingAsync(cancellationTokenSource.Token).ContinueWith(t =>
         {
-            Console.WriteLine($"Starting instance {i}/{instanceCount}...");
-            int processId = StartFortniteInstance();
-            if (processId != -1)
+            if (t.Exception != null)
+                Console.WriteLine("[DEBUG] Error in MonitorScalingAsync: " + t.Exception.Flatten().InnerException);
+        });
+
+        InstanceManagementMenu();
+    }
+
+    static async Task MonitorScalingAsync(CancellationToken token)
+    {
+        Console.WriteLine("[DEBUG] MonitorScalingAsync started.");
+        string[] settings = File.ReadAllLines(Path.Combine(AppDataPath, "blackfn_inf.txt"));
+        string apiUrl = settings[0];
+        string secretToken = settings[1]; // FIXED: Changed from settings[2] to settings[1]
+
+        while (shouldMonitor && !token.IsCancellationRequested)
+        {
+            try
             {
-                runningInstances.Add(processId);
-                Console.WriteLine($"Instance {i} started with PID: {processId}");
+                Console.WriteLine("[DEBUG] Sending GET request to API: " + apiUrl);
+                var response = await httpClient.GetAsync($"{apiUrl}/bettermomentum/matchmaker/serverInfo");
+
+                response.EnsureSuccessStatusCode();
+
+                var json = await response.Content.ReadAsStringAsync();
+                Console.WriteLine("[DEBUG] Received server info: " + json);
+
+                using JsonDocument doc = JsonDocument.Parse(json);
+                bool scalingRequired = doc.RootElement.GetProperty("server_scaling_required").GetBoolean();
+                Console.WriteLine("[DEBUG] Scaling required? " + scalingRequired);
+
+                if (scalingRequired)
+                {
+                    var account = await CreateServerAccount(apiUrl, secretToken);
+                    if (account.HasValue)
+                    {
+                        Console.WriteLine("[DEBUG] Server account created: " + account.Value.email);
+                        int pid = StartFortniteInstance(account.Value.email, account.Value.password);
+                        if (pid != -1)
+                        {
+                            runningInstances.Add(pid);
+                            instanceAccounts[pid] = account.Value.deleteToken;
+                            Console.WriteLine("[DEBUG] Fortnite instance started, PID: " + pid);
+                        }
+                        else
+                        {
+                            Console.WriteLine("[DEBUG] Failed to start Fortnite instance.");
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("[DEBUG] Failed to create server account.");
+                    }
+                }
+
+                for (int i = runningInstances.Count - 1; i >= 0; i--)
+                {
+                    int pid = runningInstances[i];
+                    try
+                    {
+                        var process = Process.GetProcessById(pid);
+                        if (process.HasExited) throw new Exception("Process stopped");
+                    }
+                    catch
+                    {
+                        Console.WriteLine("[DEBUG] Instance PID " + pid + " exited.");
+                        if (instanceAccounts.TryGetValue(pid, out string deleteToken))
+                        {
+                            await DeleteServerAccount(apiUrl, deleteToken);
+                            instanceAccounts.Remove(pid);
+                            Console.WriteLine("[DEBUG] Deleted server account for PID " + pid);
+                        }
+                        runningInstances.RemoveAt(i);
+                    }
+                }
+
             }
-            else
+            catch (Exception ex)
             {
-                Console.WriteLine($"Failed to start instance {i}");
+                Console.WriteLine("[DEBUG] Exception in MonitorScalingAsync: " + ex);
             }
 
-            if (i < instanceCount)
-                Thread.Sleep(5000);
+            await Task.Delay(35000, token);
         }
 
-        if (runningInstances.Count > 0)
+        Console.WriteLine("[DEBUG] MonitorScalingAsync stopped.");
+    }
+
+    static async Task<(string username, string email, string password, string deleteToken)?> CreateServerAccount(string apiUrl, string serverKey)
+    {
+        try
         {
-            Console.WriteLine($"\n{runningInstances.Count} instances started successfully!");
-            shouldMonitor = true;
+            Console.WriteLine("[DEBUG] Creating server account...");
+            Console.WriteLine("[DEBUG] Using serverKey: " + serverKey); // Added for debugging
+            var payload = new { serverKey };
+            var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
 
-            Task.Run(() => MonitorInstances(cancellationTokenSource.Token));
+            var response = await httpClient.PostAsync($"{apiUrl}/bettermomentum/serveraccount/create", content);
+            Console.WriteLine("[DEBUG] Server account creation response: " + response.StatusCode);
 
-            InstanceManagementMenu();
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorContent = await response.Content.ReadAsStringAsync();
+                Console.WriteLine("[DEBUG] Error response: " + errorContent);
+                Console.WriteLine("[DEBUG] Failed to create server account");
+                return null;
+            }
+
+            var json = await response.Content.ReadAsStringAsync();
+            using JsonDocument doc = JsonDocument.Parse(json);
+            string username = doc.RootElement.GetProperty("username").GetString();
+            string email = doc.RootElement.GetProperty("email").GetString();
+            string password = doc.RootElement.GetProperty("password").GetString();
+            string deleteToken = doc.RootElement.GetProperty("deleteToken").GetString();
+
+            Console.WriteLine("[DEBUG] Server account details: " + username + ", " + email);
+            return (username, email, password, deleteToken);
         }
-        else
+        catch (Exception ex)
         {
-            Console.WriteLine("No instances were started successfully.");
-            Console.ReadKey();
-            StartMenu();
+            Console.WriteLine("[DEBUG] Exception in CreateServerAccount: " + ex);
+            return null;
+        }
+    }
+
+    static async Task DeleteServerAccount(string apiUrl, string deleteToken)
+    {
+        try
+        {
+            Console.WriteLine("[DEBUG] Deleting server account with token: " + deleteToken);
+            var payload = new { deleteToken };
+            var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+
+            var response = await httpClient.PostAsync($"{apiUrl}/bettermomentum/serveraccount/delete", content);
+            Console.WriteLine("[DEBUG] Delete server account response: " + response.StatusCode);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[DEBUG] Exception in DeleteServerAccount: " + ex);
+        }
+    }
+
+    static int StartFortniteInstance(string email, string password)
+    {
+        Console.WriteLine("[DEBUG] Starting Fortnite instance for " + email);
+        string[] settings = File.ReadAllLines(Path.Combine(AppDataPath, "blackfn_inf.txt"));
+        string fortnitePath = settings[2]; // FIXED: Changed from settings[3] to settings[2]
+
+        string exePath = Path.Combine(fortnitePath, "FortniteGame", "Binaries", "Win64", "FortniteClient-Win64-Shipping.exe");
+
+        Console.WriteLine("[DEBUG] Fortnite EXE Path: " + exePath);
+
+        if (!File.Exists(exePath))
+        {
+            Console.WriteLine("[DEBUG] EXE does not exist!");
+            return -1;
+        }
+
+        try
+        {
+            ProcessStartInfo psi = new ProcessStartInfo(exePath)
+            {
+                Arguments = $"-epicapp=Fortnite -epicenv=Prod -epiclocale=en-us -epicportal -skippatchcheck -nobe -fromfl=eac -fltoken=3db3ba5dcbd2e16703f3978d -AUTH_LOGIN={email} -AUTH_PASSWORD={password} -AUTH_TYPE=epic -nosplash -nosound -nullrhi",
+                UseShellExecute = true
+            };
+            var process = Process.Start(psi);
+
+            if (process != null)
+            {
+                Console.WriteLine("[DEBUG] Starting Fortnite Server (this could take a while)...");
+                FakeAC.Start(fortnitePath, "FortniteClient-Win64-Shipping_BE.exe", $"-epicapp=Fortnite -epicenv=Prod -epiclocale=en-us -epicportal -noeac -fromfl=be -fltoken=h1cdhchd10150221h130eB56 -skippatchcheck", "r");
+                FakeAC.Start(fortnitePath, "FortniteClient-Win64-Shipping_EAC.exe");
+                FakeAC.Start(fortnitePath, "FortniteLauncher.exe", $"-epicapp=Fortnite -epicenv=Prod -epiclocale=en-us -epicportal -noeac -fromfl=be -fltoken=h1cdhchd10150221h130eB56 -skippatchcheck", "dsf");
+                Injector.Inject(process.Id, Path.Combine(DllPath, "Backend.dll"));
+                Thread.Sleep(60000);
+                Injector.Inject(process.Id, Path.Combine(DllPath, "server.dll"));
+                Console.WriteLine("[DEBUG] Server started! PID: " + process.Id);
+                return process.Id;
+            }
+
+            return -1;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("[DEBUG] Exception in StartFortniteInstance: " + ex);
+            return -1;
         }
     }
 
@@ -139,7 +281,7 @@ class BlackFN
         {
             Console.Clear();
             Console.WriteLine("============================");
-            Console.WriteLine("SERVER STARTER V2");
+            Console.WriteLine("SERVER STARTER V3");
             Console.WriteLine($"Running instances: {runningInstances.Count}");
             Console.WriteLine("============================");
             Console.WriteLine("-> 1 - Stop all Instances");
@@ -149,17 +291,8 @@ class BlackFN
 
             string choice = Console.ReadLine();
 
-            if (choice == "1")
-            {
-                StopAllInstances();
-                break;
-            }
-            else if (choice == "2")
-            {
-                ShowInstanceStatus();
-                Console.WriteLine("Press any key to continue...");
-                Console.ReadKey();
-            }
+            if (choice == "1") { StopAllInstances(); break; }
+            else if (choice == "2") { ShowInstanceStatus(); Console.ReadKey(); }
 
             Thread.Sleep(1000);
         }
@@ -169,27 +302,25 @@ class BlackFN
 
     static void ShowInstanceStatus()
     {
-        Console.WriteLine("\nInstance Status:");
-        Console.WriteLine("================");
-
+        Console.WriteLine("[DEBUG] Showing instance status:");
         for (int i = 0; i < runningInstances.Count; i++)
         {
             int pid = runningInstances[i];
             try
             {
-                Process process = Process.GetProcessById(pid);
-                Console.WriteLine($"Instance {i + 1}: PID {pid} - Running ({process.ProcessName})");
+                var process = Process.GetProcessById(pid);
+                Console.WriteLine($"[DEBUG] PID {pid} is running.");
             }
             catch
             {
-                Console.WriteLine($"Instance {i + 1}: PID {pid} - Not Running");
+                Console.WriteLine($"[DEBUG] PID {pid} not found.");
             }
         }
     }
 
     static void StopAllInstances()
     {
-        Console.WriteLine("Stopping all instances...");
+        Console.WriteLine("[DEBUG] Stopping all instances...");
         shouldMonitor = false;
         cancellationTokenSource.Cancel();
 
@@ -197,125 +328,20 @@ class BlackFN
         {
             try
             {
-                Process process = Process.GetProcessById(pid);
-                process.Kill();
-                Console.WriteLine($"Stopped instance with PID: {pid}");
+                Process.GetProcessById(pid).Kill();
+                Console.WriteLine("[DEBUG] Killed PID " + pid);
+                if (instanceAccounts.TryGetValue(pid, out string deleteToken))
+                    DeleteServerAccount(File.ReadAllLines(Path.Combine(AppDataPath, "blackfn_inf.txt"))[0], deleteToken).Wait();
             }
-            catch
+            catch (Exception ex)
             {
-                Console.WriteLine($"Instance with PID {pid} was already stopped");
+                Console.WriteLine("[DEBUG] Exception while stopping PID " + pid + ": " + ex);
             }
         }
 
         runningInstances.Clear();
-        Console.WriteLine("All instances stopped.");
-        Console.ReadKey();
-    }
-
-    static async Task MonitorInstances(CancellationToken cancellationToken)
-    {
-        while (shouldMonitor && !cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                for (int i = runningInstances.Count - 1; i >= 0; i--)
-                {
-                    int pid = runningInstances[i];
-
-                    try
-                    {
-                        Process process = Process.GetProcessById(pid);
-                        if (process.HasExited)
-                        {
-                            throw new ArgumentException("Process has exited");
-                        }
-                    }
-                    catch
-                    {
-                        Console.WriteLine($"Instance with PID {pid} has stopped. Restarting...");
-                        runningInstances.RemoveAt(i);
-
-                        if (shouldMonitor)
-                        {
-                            int newPid = StartFortniteInstance();
-                            if (newPid != -1)
-                            {
-                                runningInstances.Add(newPid);
-                                Console.WriteLine($"Instance restarted with new PID: {newPid}");
-                            }
-                            else
-                            {
-                                Console.WriteLine("Failed to restart instance");
-                            }
-                        }
-                    }
-                }
-
-                await Task.Delay(10000, cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error in monitoring: {ex.Message}");
-                await Task.Delay(5000, cancellationToken);
-            }
-        }
-    }
-
-    static int StartFortniteInstance()
-    {
-        string filePath = Path.Combine(AppDataPath, "blackfn_inf.txt");
-        string backendDll = Path.Combine(DllPath, "Backend.dll");
-        string serverDll = Path.Combine(DllPath, "server.dll");
-
-        if (!File.Exists(filePath))
-        {
-            Console.WriteLine("Settings not found! Please configure first.");
-            return -1;
-        }
-
-        var lines = File.ReadAllLines(filePath);
-        string email = lines[0];
-        string password = lines[1];
-        string fortnitePath = lines[2];
-
-        string exePath = Path.Combine(fortnitePath, "FortniteGame", "Binaries", "Win64", "FortniteClient-Win64-Shipping.exe");
-        if (!File.Exists(exePath))
-        {
-            Console.WriteLine($"Error: Fortnite executable not found at {exePath}");
-            return -1;
-        }
-
-        try
-        {
-            ProcessStartInfo psi = new ProcessStartInfo(exePath)
-            {
-                Arguments = $"-epicapp=Fortnite -epicenv=Prod -epiclocale=en-us -epicportal -skippatchcheck -nobe -fromfl=eac -fltoken=3db3ba5dcbd2e16703f3978d -caldera=eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2NvdW50X2lkIjoiYmU5ZGE1YzJmYmVhNDQwN2IyZjQwZWJhYWQ4NTlhZDQiLCJnZW5lcmF0ZWQiOjE2Mzg3MTcyNzgsImNhbGRlcmFHdWlkIjoiMzgxMGI4NjMtMmE2NS00NDU3LTliNTgtNGRhYjNiNDgyYTg2IiwiYWNQcm92aWRlciI6IkVhc3lBbnRpQ2hlYXQiLCJub3RlcyI6IiIsImZhbGxiYWNrIjpmYWxzZX0.VAWQB67RTxhiWOxx7DBjnzDnXyyEnX7OljJm-j2d88G_WgwQ9wrE6lwMEHZHjBd1ISJdUO1UVUqkfLdU5nofBQ -AUTH_LOGIN={email} -AUTH_PASSWORD={password} -AUTH_TYPE=epic -nosplash -nosound -nullrhi",
-                UseShellExecute = true
-            };
-            Process process = Process.Start(psi);
-
-            if (process != null)
-            {
-                // FakeAC.Start(fortnitePath, "FortniteClient-Win64-Shipping_EAC.exe");
-                // FakeAC.Start(fortnitePath, "FortniteLauncher.exe");
-
-                Injector.Inject(process.Id, backendDll);
-                Thread.Sleep(60000);
-                Injector.Inject(process.Id, serverDll);
-
-                return process.Id;
-            }
-            return -1;
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine($"Error while Starting Fortnite Instance: {e.Message}");
-            return -1;
-        }
+        instanceAccounts.Clear();
+        Console.WriteLine("[DEBUG] All instances stopped.");
     }
 
     static void Settings()
@@ -324,30 +350,38 @@ class BlackFN
         string filePath = Path.Combine(AppDataPath, "blackfn_inf.txt");
         if (File.Exists(filePath)) File.Delete(filePath);
 
-        string email;
+        string apiHost;
         while (true)
         {
-            Console.Write("Enter your E-Mail: ");
-            email = Console.ReadLine();
-            if (email.Contains("@")) break;
-            Console.WriteLine("Invalid E-Mail.");
+            Console.Write("Enter API Url: ");
+            apiHost = Console.ReadLine();
+            if (!string.IsNullOrWhiteSpace(apiHost)) break;
         }
 
-        Console.Write("Enter your Password: ");
-        string password = Console.ReadLine();
+        string apiUrl = $"{apiHost}";
+
+        string secretToken;
+        while (true)
+        {
+            Console.Write("Enter Secret Token (from .env): ");
+            secretToken = Console.ReadLine();
+            if (!string.IsNullOrWhiteSpace(secretToken)) break;
+        }
 
         string fortnitePath;
         while (true)
         {
-            Console.Write("Enter the File Path of Fortnite: ");
+            Console.Write("Enter Fortnite Path: ");
             fortnitePath = Console.ReadLine();
-            string expectedFile = Path.Combine(fortnitePath, "FortniteGame", "Binaries", "Win64", "FortniteClient-Win64-Shipping.exe");
-            if (File.Exists(expectedFile)) break;
-            Console.WriteLine($"Error: File not found at {expectedFile}");
+            string exe = Path.Combine(fortnitePath, "FortniteGame", "Binaries", "Win64", "FortniteClient-Win64-Shipping.exe");
+            if (File.Exists(exe)) break;
+            Console.WriteLine("Invalid path!");
         }
 
-        File.WriteAllLines(filePath, new[] { email, password, fortnitePath });
-        Console.WriteLine("Saved!");
-        StartMenu();
+        File.WriteAllLines(filePath, new[] { apiUrl, secretToken, fortnitePath });
+        Console.WriteLine("[DEBUG] Settings saved to " + filePath);
+        Console.WriteLine($"[DEBUG] Saved - API URL: {apiUrl}");
+        Console.WriteLine($"[DEBUG] Saved - Secret Token: {secretToken}");
+        Console.WriteLine($"[DEBUG] Saved - Fortnite Path: {fortnitePath}");
     }
 }
