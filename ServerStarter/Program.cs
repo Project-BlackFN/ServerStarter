@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Utilities;
+using ServerStarter.Utilities;
 
 class BlackFN
 {
@@ -20,12 +21,22 @@ class BlackFN
     static Dictionary<int, bool> instanceSetupComplete = new Dictionary<int, bool>();
     static Dictionary<int, DateTime> instanceSetupStartTime = new Dictionary<int, DateTime>();
     static bool shouldMonitor = false;
+    static bool s4LoginEnabled = false;
     static CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
     static HttpClient httpClient = new HttpClient();
 
-    static void Main()
+    static async Task Main()
     {
         Console.WriteLine("[DEBUG] Starting application...");
+
+        AppDomain.CurrentDomain.ProcessExit += async (sender, e) => await OnProgramExit();
+        Console.CancelKeyPress += async (sender, e) =>
+        {
+            e.Cancel = true;
+            await OnProgramExit();
+            Environment.Exit(0);
+        };
+
         Directory.CreateDirectory(AppDataPath);
         if (!CheckRequiredFiles())
         {
@@ -36,7 +47,43 @@ class BlackFN
         }
 
         Console.WriteLine("[DEBUG] All required files are present.");
-        StartMenu();
+        await StartMenu();
+    }
+
+    static async Task OnProgramExit()
+    {
+        Console.WriteLine("[DEBUG] Program closing, cleaning up...");
+
+        if (s4LoginEnabled)
+        {
+            Console.WriteLine("[DEBUG] Stopping S4Login proxy server...");
+            var result = await S4Login.StopServerAsync();
+            if (result.ContainsKey("success") && (bool)result["success"])
+            {
+                Console.WriteLine("[DEBUG] S4Login proxy server stopped successfully.");
+            }
+            else
+            {
+                Console.WriteLine("[DEBUG] Failed to stop S4Login proxy server: " + (result.ContainsKey("error") ? result["error"] : "Unknown error"));
+            }
+        }
+
+        if (runningInstances.Count > 0)
+        {
+            Console.WriteLine("[DEBUG] Stopping all running instances...");
+            foreach (int pid in runningInstances)
+            {
+                try
+                {
+                    Process.GetProcessById(pid).Kill();
+                    CleanupInstance(pid);
+                }
+                catch { }
+            }
+            runningInstances.Clear();
+        }
+
+        Console.WriteLine("[DEBUG] Cleanup complete.");
     }
 
     static bool CheckRequiredFiles()
@@ -58,7 +105,7 @@ class BlackFN
         return allFilesFound;
     }
 
-    static void StartMenu()
+    static async Task StartMenu()
     {
         Console.WriteLine("-----------------------------");
         Console.WriteLine("-> 1 - Settings");
@@ -67,12 +114,12 @@ class BlackFN
         Console.Write("What is your Choice: ");
         string option = Console.ReadLine();
 
-        if (option == "1") Settings();
-        else if (option == "2") StartFNServer();
-        else StartMenu();
+        if (option == "1") await Settings();
+        else if (option == "2") await StartFNServer();
+        else await StartMenu();
     }
 
-    static void StartFNServer()
+    static async Task StartFNServer()
     {
         Console.WriteLine("[DEBUG] Starting FN Server...");
         string filePath = Path.Combine(AppDataPath, "blackfn_inf.txt");
@@ -80,7 +127,7 @@ class BlackFN
         {
             Console.WriteLine("[DEBUG] Settings file not found.");
             Console.WriteLine("Settings not found! Please configure first.");
-            StartMenu();
+            await StartMenu();
             return;
         }
 
@@ -88,6 +135,65 @@ class BlackFN
         Console.WriteLine("[DEBUG] Loaded settings:");
         for (int i = 0; i < settings.Length; i++)
             Console.WriteLine($"[DEBUG] Line {i}: {settings[i]}");
+
+        string fortnitePath = settings[2];
+
+        if (settings.Length > 3 && settings[3].Equals("true", StringComparison.OrdinalIgnoreCase))
+        {
+            s4LoginEnabled = true;
+            Console.WriteLine("[DEBUG] S4Login is enabled, verifying required files...");
+
+            string paksPath = Path.Combine(fortnitePath, "FortniteGame", "Content", "Paks");
+            string loginFixPak = Path.Combine(paksPath, "pakchunkLoginFix-WindowsClient.pak");
+            string loginFixSig = Path.Combine(paksPath, "pakchunkLoginFix-WindowsClient.sig");
+
+            bool filesOk = true;
+
+            if (!File.Exists(loginFixPak))
+            {
+                Console.WriteLine("[ERROR] S4Login is enabled but pakchunkLoginFix-WindowsClient.pak not found!");
+                Console.WriteLine($"[ERROR] Expected location: {loginFixPak}");
+                filesOk = false;
+            }
+
+            if (!File.Exists(loginFixSig))
+            {
+                Console.WriteLine("[ERROR] S4Login is enabled but pakchunkLoginFix-WindowsClient.sig not found!");
+                Console.WriteLine($"[ERROR] Expected location: {loginFixSig}");
+                filesOk = false;
+            }
+
+            if (!filesOk)
+            {
+                Console.WriteLine("Please add the LoginFix pak and sig files to continue.");
+                Console.WriteLine("Press any key to return to menu...");
+                Console.ReadKey();
+                await StartMenu();
+                return;
+            }
+
+            Console.WriteLine("[DEBUG] LoginFix pak and sig files found.");
+            Console.WriteLine("[DEBUG] Starting S4Login proxy server...");
+
+            var result = await S4Login.StartServerAsync();
+            if (result.ContainsKey("success") && (bool)result["success"])
+            {
+                Console.WriteLine("[DEBUG] S4Login proxy server started successfully on 127.0.0.1:8010");
+            }
+            else
+            {
+                Console.WriteLine("[DEBUG] Failed to start S4Login proxy server: " + (result.ContainsKey("error") ? result["error"] : "Unknown error"));
+                Console.WriteLine("Press any key to continue...");
+                Console.ReadKey();
+                await StartMenu();
+                return;
+            }
+        }
+        else
+        {
+            s4LoginEnabled = false;
+            Console.WriteLine("[DEBUG] S4Login is disabled.");
+        }
 
         shouldMonitor = true;
 
@@ -97,7 +203,7 @@ class BlackFN
                 Console.WriteLine("[DEBUG] Error in MonitorScalingAsync: " + t.Exception.Flatten().InnerException);
         });
 
-        InstanceManagementMenu();
+        await InstanceManagementMenu();
     }
 
     static async Task MonitorScalingAsync(CancellationToken token)
@@ -311,7 +417,7 @@ class BlackFN
         {
             ProcessStartInfo psi = new ProcessStartInfo(exePath)
             {
-                Arguments = $"-epicapp=Fortnite -epicenv=Prod -epiclocale=en-us -epicportal -skippatchcheck -nobe -fromfl=eac -fltoken=3db3ba5dcbd2e16703f3978d -AUTH_LOGIN={email} -AUTH_PASSWORD={password} -AUTH_TYPE=epic -nosplash -nosound -nullrhi",
+                Arguments = $"-epicapp=Fortnite -epicenv=Prod -epiclocale=en-us -epicportal -skippatchcheck -nobe -fromfl=eac -fltoken=3db3ba5dcbd2e16703f3978d -caldera=eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2NvdW50X2lkIjoiYmU5ZGE1YzJmYmVhNDQwN2IyZjQwZWJhYWQ4NTlhZDQiLCJnZW5lcmF0ZWQiOjE2Mzg3MTcyNzgsImNhbGRlcmFHdWlkIjoiMzgxMGI4NjMtMmE2NS00NDU3LTliNTgtNGRhYjNiNDgyYTg2IiwiYWNQcm92aWRlciI6IkVhc3lBbnRpQ2hlYXQiLCJub3RlcyI6IiIsImZhbGxiYWNrIjpmYWxzZX0.VAWQB67RTxhiWOxx7DBjnzDnXyyEnX7OljJm-j2d88G_WgwQ9wrE6lwMEHZHjBd1ISJdUO1UVUqkfLdU5nofBQ -AUTH_LOGIN={email} -AUTH_PASSWORD={password} -AUTH_TYPE=epic -nosplash -nosound -nullrhi",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
@@ -329,9 +435,8 @@ class BlackFN
                 instanceOutputHandlers[process.Id] = outputHandler;
                 outputHandler.Start();
 
-                FakeAC.Start(fortnitePath, "FortniteClient-Win64-Shipping_BE.exe", $"-epicapp=Fortnite -epicenv=Prod -epiclocale=en-us -epicportal -noeac -fromfl=be -fltoken=h1cdhchd10150221h130eB56 -skippatchcheck", "r");
                 FakeAC.Start(fortnitePath, "FortniteClient-Win64-Shipping_EAC.exe");
-                FakeAC.Start(fortnitePath, "FortniteLauncher.exe", $"-epicapp=Fortnite -epicenv=Prod -epiclocale=en-us -epicportal -noeac -fromfl=be -fltoken=h1cdhchd10150221h130eB56 -skippatchcheck", "dsf");
+                FakeAC.Start(fortnitePath, "FortniteLauncher.exe");
 
                 Console.WriteLine("[DEBUG] Server started! PID: " + process.Id);
                 Console.WriteLine("[DEBUG] Backend.dll will be injected on startup, memory.dll and server.dll after login detection...");
@@ -354,13 +459,6 @@ class BlackFN
 
         try
         {
-            Console.WriteLine($"[DEBUG] Injecting memory.dll into PID {processId}...");
-            Injector.Inject(processId, Path.Combine(DllPath, "memory.dll"));
-            Console.WriteLine($"[DEBUG] memory.dll successfully injected into PID {processId}");
-
-            Console.WriteLine($"[DEBUG] Waiting 5 seconds before injecting server.dll...");
-            await Task.Delay(5000);
-
             Console.WriteLine($"[DEBUG] Injecting server.dll into PID {processId}...");
             Injector.Inject(processId, Path.Combine(DllPath, "server.dll"));
             Console.WriteLine($"[DEBUG] server.dll successfully injected into PID {processId}");
@@ -379,7 +477,7 @@ class BlackFN
         }
     }
 
-    static void InstanceManagementMenu()
+    static async Task InstanceManagementMenu()
     {
         while (shouldMonitor)
         {
@@ -387,6 +485,7 @@ class BlackFN
             Console.WriteLine("============================");
             Console.WriteLine("SERVER STARTER V3");
             Console.WriteLine($"Running instances: {runningInstances.Count}");
+            Console.WriteLine($"S4Login Proxy: {(s4LoginEnabled ? "Enabled" : "Disabled")}");
 
             int instancesInSetup = 0;
             foreach (var instance in instanceSetupComplete)
@@ -403,13 +502,13 @@ class BlackFN
 
             string choice = Console.ReadLine();
 
-            if (choice == "1") { StopAllInstances(); break; }
+            if (choice == "1") { await StopAllInstances(); break; }
             else if (choice == "2") { ShowInstanceStatus(); Console.ReadKey(); }
 
             Thread.Sleep(1000);
         }
 
-        StartMenu();
+        await StartMenu();
     }
 
     static void ShowInstanceStatus()
@@ -440,7 +539,7 @@ class BlackFN
         }
     }
 
-    static void StopAllInstances()
+    static async Task StopAllInstances()
     {
         Console.WriteLine("[DEBUG] Stopping all instances...");
         shouldMonitor = false;
@@ -462,23 +561,40 @@ class BlackFN
 
         runningInstances.Clear();
         Console.WriteLine("[DEBUG] All instances stopped.");
+
+        if (s4LoginEnabled)
+        {
+            Console.WriteLine("[DEBUG] Stopping S4Login proxy server...");
+            var result = await S4Login.StopServerAsync();
+            if (result.ContainsKey("success") && (bool)result["success"])
+            {
+                Console.WriteLine("[DEBUG] S4Login proxy server stopped successfully.");
+            }
+            else
+            {
+                Console.WriteLine("[DEBUG] Failed to stop S4Login proxy server: " + (result.ContainsKey("error") ? result["error"] : "Unknown error"));
+            }
+            s4LoginEnabled = false;
+        }
     }
 
-    static void Settings()
+    static async Task Settings()
     {
         Directory.CreateDirectory(AppDataPath);
         string filePath = Path.Combine(AppDataPath, "blackfn_inf.txt");
+        string configPath = Path.Combine(AppDataPath, "config.txt");
+
         if (File.Exists(filePath)) File.Delete(filePath);
 
         string apiHost;
         while (true)
         {
-            Console.Write("Enter API Url: ");
+            Console.Write("Enter API Host (e.g., api.backend-mypro.dev): ");
             apiHost = Console.ReadLine();
             if (!string.IsNullOrWhiteSpace(apiHost)) break;
         }
 
-        string apiUrl = $"{apiHost}";
+        string apiUrl = $"https://{apiHost}";
 
         string secretToken;
         while (true)
@@ -498,13 +614,62 @@ class BlackFN
             Console.WriteLine("Invalid path!");
         }
 
-        File.WriteAllLines(filePath, new[] { apiUrl, secretToken, fortnitePath });
+        string useS4Login;
+        bool s4Enabled = false;
+        while (true)
+        {
+            Console.Write("Use S4Login Proxy? (yes/no): ");
+            useS4Login = Console.ReadLine()?.ToLower();
+            if (useS4Login == "yes" || useS4Login == "y")
+            {
+                s4Enabled = true;
+
+                string paksPath = Path.Combine(fortnitePath, "FortniteGame", "Content", "Paks");
+                string loginFixPak = Path.Combine(paksPath, "pakchunkLoginFix-WindowsClient.pak");
+                string loginFixSig = Path.Combine(paksPath, "pakchunkLoginFix-WindowsClient.sig");
+
+                if (!File.Exists(loginFixPak) || !File.Exists(loginFixSig))
+                {
+                    Console.WriteLine("[WARNING] S4Login enabled but LoginFix files not found!");
+                    Console.WriteLine($"[WARNING] pak location: {loginFixPak}");
+                    Console.WriteLine($"[WARNING] sig location: {loginFixSig}");
+                    Console.Write("Continue anyway? (yes/no): ");
+                    string continueAnyway = Console.ReadLine()?.ToLower();
+                    if (continueAnyway != "yes" && continueAnyway != "y")
+                    {
+                        Console.WriteLine("Please add the LoginFix files and try again.");
+                        continue;
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("[SUCCESS] LoginFix pak and sig files found!");
+                }
+                break;
+            }
+            else if (useS4Login == "no" || useS4Login == "n")
+            {
+                s4Enabled = false;
+                break;
+            }
+            Console.WriteLine("Please enter 'yes' or 'no'");
+        }
+
+        File.WriteAllLines(filePath, new[] { apiUrl, secretToken, fortnitePath, s4Enabled.ToString() });
+
+        File.WriteAllText(configPath, $"UseS4Login={s4Enabled}");
+
         Console.WriteLine("[DEBUG] Settings saved to " + filePath);
+        Console.WriteLine("[DEBUG] Config saved to " + configPath);
         Console.WriteLine($"[DEBUG] Saved - API URL: {apiUrl}");
         Console.WriteLine($"[DEBUG] Saved - Secret Token: {secretToken}");
         Console.WriteLine($"[DEBUG] Saved - Fortnite Path: {fortnitePath}");
+        Console.WriteLine($"[DEBUG] Saved - S4Login Enabled: {s4Enabled}");
+
+        await StartMenu();
     }
 }
+
 public class ProcessOutputHandler
 {
     private Process _process;
@@ -578,12 +743,15 @@ public class ProcessOutputHandler
     private void HandleOutputLine(string line)
     {
         string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
-        Console.WriteLine($"[{timestamp}] [GAME OUTPUT] {line}");
 
         if (line.Contains("Successfully logged in user"))
         {
-            Console.WriteLine($"[{timestamp}] [GAME] Login detected - triggering memory.dll and server.dll injection");
+            Console.WriteLine($"[{timestamp}] [GAME] Login detected");
             LoginDetected?.Invoke(this, EventArgs.Empty);
+        }
+        else
+        {
+            Console.WriteLine($"[GAME OUTPUT] {line}");
         }
     }
 }
