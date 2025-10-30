@@ -12,22 +12,30 @@ using ServerStarter.Utilities;
 
 class BlackFN
 {
-    static string AppDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "BlackFN_Server");
+    static string AppDataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ServerStarter");
+    static string LogPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ServerStarter", "log");
     static string DllPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "dll");
     static List<int> runningInstances = new List<int>();
-    static Dictionary<int, string> instanceAccounts = new Dictionary<int, string>();
     static Dictionary<int, ProcessOutputHandler> instanceOutputHandlers = new Dictionary<int, ProcessOutputHandler>();
     static Dictionary<int, bool> instanceBackendInjected = new Dictionary<int, bool>();
     static Dictionary<int, bool> instanceSetupComplete = new Dictionary<int, bool>();
+    static Dictionary<int, bool> instanceListeningDetected = new Dictionary<int, bool>();
     static Dictionary<int, DateTime> instanceSetupStartTime = new Dictionary<int, DateTime>();
+    static Dictionary<int, string> instanceLogFiles = new Dictionary<int, string>();
+    static Dictionary<int, (string email, string password)> instanceCredentials = new Dictionary<int, (string, string)>();
     static bool shouldMonitor = false;
-    static bool s4LoginEnabled = false;
     static CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
     static HttpClient httpClient = new HttpClient();
+    static int logCounter = 1;
+    static bool debugMode = false;
+    static int maxServerInstances = 5;
 
-    static async Task Main()
+    static async Task Main(string[] args)
     {
-        Console.WriteLine("[DEBUG] Starting application...");
+        debugMode = args.Length > 0 && args[0] == "-debug";
+
+        if (debugMode)
+            Console.WriteLine("[DEBUG] Starting application...");
 
         AppDomain.CurrentDomain.ProcessExit += async (sender, e) => await OnProgramExit();
         Console.CancelKeyPress += async (sender, e) =>
@@ -38,39 +46,45 @@ class BlackFN
         };
 
         Directory.CreateDirectory(AppDataPath);
+        Directory.CreateDirectory(LogPath);
+
         if (!CheckRequiredFiles())
         {
-            Console.WriteLine("[DEBUG] Required DLLs missing.");
-            Console.WriteLine("A few DLLs were not found, please add them..");
+            Console.WriteLine("Required DLLs missing. Please add them and restart.");
             Console.ReadKey();
             return;
         }
 
-        Console.WriteLine("[DEBUG] All required files are present.");
+        if (debugMode)
+            Console.WriteLine("[DEBUG] All required files are present.");
+
         await StartMenu();
+    }
+
+    static string GetNextLogFileName()
+    {
+        while (true)
+        {
+            string logFile = Path.Combine(LogPath, $"log-{logCounter}.txt");
+            if (!File.Exists(logFile))
+            {
+                logCounter++;
+                return logFile;
+            }
+            logCounter++;
+        }
     }
 
     static async Task OnProgramExit()
     {
-        Console.WriteLine("[DEBUG] Program closing, cleaning up...");
-
-        if (s4LoginEnabled)
-        {
-            Console.WriteLine("[DEBUG] Stopping S4Login proxy server...");
-            var result = await S4Login.StopServerAsync();
-            if (result.ContainsKey("success") && (bool)result["success"])
-            {
-                Console.WriteLine("[DEBUG] S4Login proxy server stopped successfully.");
-            }
-            else
-            {
-                Console.WriteLine("[DEBUG] Failed to stop S4Login proxy server: " + (result.ContainsKey("error") ? result["error"] : "Unknown error"));
-            }
-        }
+        if (debugMode)
+            Console.WriteLine("[DEBUG] Program closing, cleaning up...");
 
         if (runningInstances.Count > 0)
         {
-            Console.WriteLine("[DEBUG] Stopping all running instances...");
+            if (debugMode)
+                Console.WriteLine("[DEBUG] Stopping all running instances...");
+
             foreach (int pid in runningInstances)
             {
                 try
@@ -83,24 +97,41 @@ class BlackFN
             runningInstances.Clear();
         }
 
-        Console.WriteLine("[DEBUG] Cleanup complete.");
+        if (debugMode)
+            Console.WriteLine("[DEBUG] Cleanup complete.");
     }
 
     static bool CheckRequiredFiles()
     {
-        string backendDllPath = Path.Combine(DllPath, "Backend.dll");
+        string backendDllPath = Path.Combine(DllPath, "backend.dll");
         string memoryDllPath = Path.Combine(DllPath, "memory.dll");
         string serverDllPath = Path.Combine(DllPath, "server.dll");
 
-        Console.WriteLine("[DEBUG] Checking DLLs in " + DllPath);
+        if (debugMode)
+            Console.WriteLine("[DEBUG] Checking DLLs in " + DllPath);
 
         if (!Directory.Exists(DllPath)) return false;
 
         bool allFilesFound = true;
 
-        if (!File.Exists(backendDllPath)) { allFilesFound = false; Console.WriteLine("[DEBUG] Backend.dll missing"); }
-        if (!File.Exists(memoryDllPath)) { allFilesFound = false; Console.WriteLine("[DEBUG] memory.dll missing"); }
-        if (!File.Exists(serverDllPath)) { allFilesFound = false; Console.WriteLine("[DEBUG] server.dll missing"); }
+        if (!File.Exists(backendDllPath))
+        {
+            allFilesFound = false;
+            if (debugMode)
+                Console.WriteLine("[DEBUG] backend.dll missing");
+        }
+        if (!File.Exists(memoryDllPath))
+        {
+            allFilesFound = false;
+            if (debugMode)
+                Console.WriteLine("[DEBUG] memory.dll missing");
+        }
+        if (!File.Exists(serverDllPath))
+        {
+            allFilesFound = false;
+            if (debugMode)
+                Console.WriteLine("[DEBUG] server.dll missing");
+        }
 
         return allFilesFound;
     }
@@ -109,7 +140,7 @@ class BlackFN
     {
         Console.WriteLine("-----------------------------");
         Console.WriteLine("-> 1 - Settings");
-        Console.WriteLine("-> 2 - Start Fortnite Server");
+        Console.WriteLine("-> 2 - Start ServerStarter Manager");
         Console.WriteLine("-----------------------------");
         Console.Write("What is your Choice: ");
         string option = Console.ReadLine();
@@ -119,87 +150,82 @@ class BlackFN
         else await StartMenu();
     }
 
+    static async Task<string> DetectApiUrlWithPort(string baseUrl)
+    {
+        string[] protocols = { "https://", "http://" };
+        int[] ports = { 3551, 443 };
+
+        foreach (string protocol in protocols)
+        {
+            foreach (int port in ports)
+            {
+                string testUrl = $"{protocol}{baseUrl}:{port}";
+                try
+                {
+                    if (debugMode)
+                        Console.WriteLine($"[DEBUG] Testing connection to {testUrl}");
+
+                    var response = await httpClient.GetAsync($"{testUrl}/bettermomentum/matchmaker/serverInfo",
+                        new CancellationTokenSource(TimeSpan.FromSeconds(5)).Token);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        if (debugMode)
+                            Console.WriteLine($"[DEBUG] Successfully connected to {testUrl}");
+                        return testUrl;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (debugMode)
+                        Console.WriteLine($"[DEBUG] Failed to connect to {testUrl}: {ex.Message}");
+                }
+            }
+        }
+
+        return null;
+    }
+
     static async Task StartFNServer()
     {
-        Console.WriteLine("[DEBUG] Starting FN Server...");
+        if (debugMode)
+            Console.WriteLine("[DEBUG] Starting FN Server...");
+
         string filePath = Path.Combine(AppDataPath, "blackfn_inf.txt");
+        string configPath = Path.Combine(AppDataPath, "config.txt");
+
         if (!File.Exists(filePath))
         {
-            Console.WriteLine("[DEBUG] Settings file not found.");
             Console.WriteLine("Settings not found! Please configure first.");
             await StartMenu();
             return;
         }
 
-        string[] settings = File.ReadAllLines(filePath);
-        Console.WriteLine("[DEBUG] Loaded settings:");
-        for (int i = 0; i < settings.Length; i++)
-            Console.WriteLine($"[DEBUG] Line {i}: {settings[i]}");
-
-        string fortnitePath = settings[2];
-
-        if (settings.Length > 3 && settings[3].Equals("true", StringComparison.OrdinalIgnoreCase))
+        if (File.Exists(configPath))
         {
-            s4LoginEnabled = true;
-            Console.WriteLine("[DEBUG] S4Login is enabled, verifying required files...");
-
-            string paksPath = Path.Combine(fortnitePath, "FortniteGame", "Content", "Paks");
-            string loginFixPak = Path.Combine(paksPath, "pakchunkLoginFix-WindowsClient.pak");
-            string loginFixSig = Path.Combine(paksPath, "pakchunkLoginFix-WindowsClient.sig");
-
-            bool filesOk = true;
-
-            if (!File.Exists(loginFixPak))
+            string maxServersLine = File.ReadAllText(configPath);
+            if (int.TryParse(maxServersLine, out int maxServers))
             {
-                Console.WriteLine("[ERROR] S4Login is enabled but pakchunkLoginFix-WindowsClient.pak not found!");
-                Console.WriteLine($"[ERROR] Expected location: {loginFixPak}");
-                filesOk = false;
-            }
-
-            if (!File.Exists(loginFixSig))
-            {
-                Console.WriteLine("[ERROR] S4Login is enabled but pakchunkLoginFix-WindowsClient.sig not found!");
-                Console.WriteLine($"[ERROR] Expected location: {loginFixSig}");
-                filesOk = false;
-            }
-
-            if (!filesOk)
-            {
-                Console.WriteLine("Please add the LoginFix pak and sig files to continue.");
-                Console.WriteLine("Press any key to return to menu...");
-                Console.ReadKey();
-                await StartMenu();
-                return;
-            }
-
-            Console.WriteLine("[DEBUG] LoginFix pak and sig files found.");
-            Console.WriteLine("[DEBUG] Starting S4Login proxy server...");
-
-            var result = await S4Login.StartServerAsync();
-            if (result.ContainsKey("success") && (bool)result["success"])
-            {
-                Console.WriteLine("[DEBUG] S4Login proxy server started successfully on 127.0.0.1:8010");
-            }
-            else
-            {
-                Console.WriteLine("[DEBUG] Failed to start S4Login proxy server: " + (result.ContainsKey("error") ? result["error"] : "Unknown error"));
-                Console.WriteLine("Press any key to continue...");
-                Console.ReadKey();
-                await StartMenu();
-                return;
+                maxServerInstances = maxServers;
+                if (debugMode)
+                    Console.WriteLine($"[DEBUG] Max server instances: {maxServerInstances}");
             }
         }
-        else
+
+        string[] settings = File.ReadAllLines(filePath);
+
+        if (debugMode)
         {
-            s4LoginEnabled = false;
-            Console.WriteLine("[DEBUG] S4Login is disabled.");
+            Console.WriteLine("[DEBUG] Loaded settings:");
+            for (int i = 0; i < settings.Length; i++)
+                Console.WriteLine($"[DEBUG] Line {i}: {settings[i]}");
         }
 
         shouldMonitor = true;
 
         _ = MonitorScalingAsync(cancellationTokenSource.Token).ContinueWith(t =>
         {
-            if (t.Exception != null)
+            if (t.Exception != null && debugMode)
                 Console.WriteLine("[DEBUG] Error in MonitorScalingAsync: " + t.Exception.Flatten().InnerException);
         });
 
@@ -208,7 +234,9 @@ class BlackFN
 
     static async Task MonitorScalingAsync(CancellationToken token)
     {
-        Console.WriteLine("[DEBUG] MonitorScalingAsync started.");
+        if (debugMode)
+            Console.WriteLine("[DEBUG] MonitorScalingAsync started.");
+
         string[] settings = File.ReadAllLines(Path.Combine(AppDataPath, "blackfn_inf.txt"));
         string apiUrl = settings[0];
         string secretToken = settings[1];
@@ -218,6 +246,8 @@ class BlackFN
             try
             {
                 bool anyInstanceInSetup = false;
+                bool anyInstanceInWaitPeriod = false;
+
                 foreach (var instance in instanceSetupStartTime)
                 {
                     if (!instanceSetupComplete.ContainsKey(instance.Key) || !instanceSetupComplete[instance.Key])
@@ -225,52 +255,84 @@ class BlackFN
                         anyInstanceInSetup = true;
                         break;
                     }
+                    else if (instanceSetupComplete[instance.Key])
+                    {
+                        var timeSinceSetup = DateTime.Now - instanceSetupStartTime[instance.Key];
+                        if (timeSinceSetup.TotalSeconds < 70)
+                        {
+                            anyInstanceInWaitPeriod = true;
+                        }
+                    }
                 }
 
-                if (!anyInstanceInSetup)
+                if (!anyInstanceInSetup && !anyInstanceInWaitPeriod && runningInstances.Count < maxServerInstances)
                 {
-                    Console.WriteLine("[DEBUG] No instances in setup, checking scaling...");
-                    var response = await httpClient.GetAsync($"{apiUrl}/bettermomentum/matchmaker/serverInfo");
+                    if (debugMode)
+                        Console.WriteLine("[DEBUG] No instances in setup or wait period, checking scaling...");
 
+                    var response = await httpClient.GetAsync($"{apiUrl}/bettermomentum/matchmaker/serverInfo");
                     response.EnsureSuccessStatusCode();
 
                     var json = await response.Content.ReadAsStringAsync();
-                    Console.WriteLine("[DEBUG] Received server info: " + json);
+
+                    if (debugMode)
+                        Console.WriteLine("[DEBUG] Received server info: " + json);
 
                     using JsonDocument doc = JsonDocument.Parse(json);
                     bool scalingRequired = doc.RootElement.GetProperty("server_scaling_required").GetBoolean();
-                    Console.WriteLine("[DEBUG] Scaling required? " + scalingRequired);
+
+                    if (debugMode)
+                        Console.WriteLine("[DEBUG] Scaling required? " + scalingRequired);
 
                     if (scalingRequired)
                     {
                         var account = await CreateServerAccount(apiUrl, secretToken);
                         if (account.HasValue)
                         {
-                            Console.WriteLine("[DEBUG] Server account created: " + account.Value.email);
+                            Console.WriteLine($"Server account created: {account.Value.email}");
+
                             int pid = StartFortniteInstance(account.Value.email, account.Value.password);
                             if (pid != -1)
                             {
                                 runningInstances.Add(pid);
-                                instanceAccounts[pid] = account.Value.deleteToken;
                                 instanceBackendInjected[pid] = false;
                                 instanceSetupComplete[pid] = false;
+                                instanceListeningDetected[pid] = false;
                                 instanceSetupStartTime[pid] = DateTime.Now;
-                                Console.WriteLine("[DEBUG] Fortnite instance started, PID: " + pid);
+                                instanceLogFiles[pid] = GetNextLogFileName();
+                                instanceCredentials[pid] = (account.Value.email, account.Value.password);
+
+                                Console.WriteLine($"Server started with PID: {pid}");
+
+                                if (debugMode)
+                                    Console.WriteLine("[DEBUG] Log file: " + instanceLogFiles[pid]);
                             }
                             else
                             {
-                                Console.WriteLine("[DEBUG] Failed to start Fortnite instance.");
+                                Console.WriteLine("Failed to start server instance.");
                             }
                         }
                         else
                         {
-                            Console.WriteLine("[DEBUG] Failed to create server account.");
+                            Console.WriteLine("Failed to create server account.");
                         }
                     }
                 }
+                else if (runningInstances.Count >= maxServerInstances)
+                {
+                    if (debugMode)
+                        Console.WriteLine($"[DEBUG] Max instances ({maxServerInstances}) reached, skipping scaling check.");
+                }
                 else
                 {
-                    Console.WriteLine("[DEBUG] Instances in setup phase, skipping scaling check.");
+                    if (anyInstanceInSetup && debugMode)
+                    {
+                        Console.WriteLine("[DEBUG] Instances in setup phase, skipping scaling check.");
+                    }
+                    else if (anyInstanceInWaitPeriod && debugMode)
+                    {
+                        Console.WriteLine("[DEBUG] Instances in 70 second wait period, skipping scaling check.");
+                    }
                 }
 
                 for (int i = runningInstances.Count - 1; i >= 0; i--)
@@ -283,10 +345,14 @@ class BlackFN
 
                         if (!instanceBackendInjected[pid])
                         {
-                            Console.WriteLine($"[DEBUG] Injecting Backend.dll into PID {pid} on startup...");
+                            if (debugMode)
+                                Console.WriteLine($"[DEBUG] Injecting Backend.dll into PID {pid} on startup...");
+
                             Injector.Inject(pid, Path.Combine(DllPath, "Backend.dll"));
                             instanceBackendInjected[pid] = true;
-                            Console.WriteLine($"[DEBUG] Backend.dll successfully injected into PID {pid}");
+
+                            if (debugMode)
+                                Console.WriteLine($"[DEBUG] Backend.dll successfully injected into PID {pid}");
                         }
 
                         if (instanceSetupComplete.ContainsKey(pid) && instanceSetupComplete[pid])
@@ -296,7 +362,9 @@ class BlackFN
                                 var timeSinceSetup = DateTime.Now - instanceSetupStartTime[pid];
                                 if (timeSinceSetup.TotalSeconds >= 70)
                                 {
-                                    Console.WriteLine($"[DEBUG] 70 seconds passed since setup completion for PID {pid}, marking as ready.");
+                                    if (debugMode)
+                                        Console.WriteLine($"[DEBUG] 70 seconds passed since setup completion for PID {pid}, marking as ready.");
+
                                     instanceSetupComplete[pid] = false;
                                     instanceSetupStartTime.Remove(pid);
                                 }
@@ -305,34 +373,71 @@ class BlackFN
                     }
                     catch
                     {
-                        Console.WriteLine("[DEBUG] Instance PID " + pid + " exited.");
-                        CleanupInstance(pid);
-                        runningInstances.RemoveAt(i);
+                        Console.WriteLine($"Server instance PID {pid} stopped.");
+
+                        if (instanceListeningDetected.ContainsKey(pid) && !instanceListeningDetected[pid])
+                        {
+                            Console.WriteLine($"Server PID {pid} crashed before ready - restarting...");
+
+                            if (instanceCredentials.ContainsKey(pid))
+                            {
+                                var credentials = instanceCredentials[pid];
+                                CleanupInstance(pid);
+                                runningInstances.RemoveAt(i);
+
+                                int newPid = StartFortniteInstance(credentials.email, credentials.password);
+                                if (newPid != -1)
+                                {
+                                    runningInstances.Add(newPid);
+                                    instanceBackendInjected[newPid] = false;
+                                    instanceSetupComplete[newPid] = false;
+                                    instanceListeningDetected[newPid] = false;
+                                    instanceSetupStartTime[newPid] = DateTime.Now;
+                                    instanceLogFiles[newPid] = GetNextLogFileName();
+                                    instanceCredentials[newPid] = credentials;
+                                    Console.WriteLine($"Server restarted with PID: {newPid}");
+                                }
+                                else
+                                {
+                                    Console.WriteLine("Failed to restart server instance.");
+                                }
+                            }
+                            else
+                            {
+                                if (debugMode)
+                                    Console.WriteLine($"[DEBUG] No credentials found for PID {pid}, cannot restart.");
+
+                                CleanupInstance(pid);
+                                runningInstances.RemoveAt(i);
+                            }
+                        }
+                        else
+                        {
+                            if (debugMode)
+                                Console.WriteLine($"[DEBUG] Instance PID {pid} exited normally after 'Listening on port'.");
+
+                            CleanupInstance(pid);
+                            runningInstances.RemoveAt(i);
+                        }
                     }
                 }
 
             }
             catch (Exception ex)
             {
-                Console.WriteLine("[DEBUG] Exception in MonitorScalingAsync: " + ex);
+                if (debugMode)
+                    Console.WriteLine("[DEBUG] Exception in MonitorScalingAsync: " + ex);
             }
 
             await Task.Delay(35000, token);
         }
 
-        Console.WriteLine("[DEBUG] MonitorScalingAsync stopped.");
+        if (debugMode)
+            Console.WriteLine("[DEBUG] MonitorScalingAsync stopped.");
     }
 
     static void CleanupInstance(int pid)
     {
-        if (instanceAccounts.TryGetValue(pid, out string deleteToken))
-        {
-            string[] settings = File.ReadAllLines(Path.Combine(AppDataPath, "blackfn_inf.txt"));
-            string apiUrl = settings[0];
-            _ = DeleteServerAccount(apiUrl, deleteToken);
-            instanceAccounts.Remove(pid);
-            Console.WriteLine("[DEBUG] Deleted server account for PID " + pid);
-        }
         if (instanceOutputHandlers.TryGetValue(pid, out ProcessOutputHandler handler))
         {
             handler.Stop();
@@ -340,26 +445,38 @@ class BlackFN
         }
         instanceBackendInjected.Remove(pid);
         instanceSetupComplete.Remove(pid);
+        instanceListeningDetected.Remove(pid);
         instanceSetupStartTime.Remove(pid);
+        instanceLogFiles.Remove(pid);
+        instanceCredentials.Remove(pid);
     }
 
-    static async Task<(string username, string email, string password, string deleteToken)?> CreateServerAccount(string apiUrl, string serverKey)
+    static async Task<(string username, string email, string password)?> CreateServerAccount(string apiUrl, string serverKey)
     {
         try
         {
-            Console.WriteLine("[DEBUG] Creating server account...");
-            Console.WriteLine("[DEBUG] Using serverKey: " + serverKey);
+            if (debugMode)
+            {
+                Console.WriteLine("[DEBUG] Creating server account...");
+                Console.WriteLine("[DEBUG] Using serverKey: " + serverKey);
+            }
+
             var payload = new { serverKey };
             var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
 
             var response = await httpClient.PostAsync($"{apiUrl}/bettermomentum/serveraccount/create", content);
-            Console.WriteLine("[DEBUG] Server account creation response: " + response.StatusCode);
+
+            if (debugMode)
+                Console.WriteLine("[DEBUG] Server account creation response: " + response.StatusCode);
 
             if (!response.IsSuccessStatusCode)
             {
-                var errorContent = await response.Content.ReadAsStringAsync();
-                Console.WriteLine("[DEBUG] Error response: " + errorContent);
-                Console.WriteLine("[DEBUG] Failed to create server account");
+                if (debugMode)
+                {
+                    var errorContent = await response.Content.ReadAsStringAsync();
+                    Console.WriteLine("[DEBUG] Error response: " + errorContent);
+                }
+                Console.WriteLine("Failed to create server account");
                 return null;
             }
 
@@ -368,48 +485,37 @@ class BlackFN
             string username = doc.RootElement.GetProperty("username").GetString();
             string email = doc.RootElement.GetProperty("email").GetString();
             string password = doc.RootElement.GetProperty("password").GetString();
-            string deleteToken = doc.RootElement.GetProperty("deleteToken").GetString();
 
-            Console.WriteLine("[DEBUG] Server account details: " + username + ", " + email);
-            return (username, email, password, deleteToken);
+            if (debugMode)
+                Console.WriteLine("[DEBUG] Server account details: " + username + ", " + email);
+
+            return (username, email, password);
         }
         catch (Exception ex)
         {
-            Console.WriteLine("[DEBUG] Exception in CreateServerAccount: " + ex);
+            if (debugMode)
+                Console.WriteLine("[DEBUG] Exception in CreateServerAccount: " + ex);
             return null;
-        }
-    }
-
-    static async Task DeleteServerAccount(string apiUrl, string deleteToken)
-    {
-        try
-        {
-            Console.WriteLine("[DEBUG] Deleting server account with token: " + deleteToken);
-            var payload = new { deleteToken };
-            var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-
-            var response = await httpClient.PostAsync($"{apiUrl}/bettermomentum/serveraccount/delete", content);
-            Console.WriteLine("[DEBUG] Delete server account response: " + response.StatusCode);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("[DEBUG] Exception in DeleteServerAccount: " + ex);
         }
     }
 
     static int StartFortniteInstance(string email, string password)
     {
-        Console.WriteLine("[DEBUG] Starting Fortnite instance for " + email);
+        if (debugMode)
+            Console.WriteLine("[DEBUG] Starting Fortnite instance for " + email);
+
         string[] settings = File.ReadAllLines(Path.Combine(AppDataPath, "blackfn_inf.txt"));
         string fortnitePath = settings[2];
 
         string exePath = Path.Combine(fortnitePath, "FortniteGame", "Binaries", "Win64", "FortniteClient-Win64-Shipping.exe");
 
-        Console.WriteLine("[DEBUG] Fortnite EXE Path: " + exePath);
+        if (debugMode)
+            Console.WriteLine("[DEBUG] Fortnite EXE Path: " + exePath);
 
         if (!File.Exists(exePath))
         {
-            Console.WriteLine("[DEBUG] EXE does not exist!");
+            if (debugMode)
+                Console.WriteLine("[DEBUG] EXE does not exist!");
             return -1;
         }
 
@@ -428,18 +534,25 @@ class BlackFN
 
             if (process != null)
             {
-                Console.WriteLine("[DEBUG] Starting Fortnite Server (this could take a while)...");
+                Console.WriteLine("Starting Fortnite Server (this could take a while)...");
 
-                var outputHandler = new ProcessOutputHandler(process);
+                string logFile = GetNextLogFileName();
+                var outputHandler = new ProcessOutputHandler(process, logFile, debugMode);
                 outputHandler.LoginDetected += (sender, e) => OnLoginDetected(process.Id);
+                outputHandler.ListeningDetected += (sender, e) => OnListeningDetected(process.Id);
                 instanceOutputHandlers[process.Id] = outputHandler;
+                instanceLogFiles[process.Id] = logFile;
                 outputHandler.Start();
 
                 FakeAC.Start(fortnitePath, "FortniteClient-Win64-Shipping_EAC.exe");
                 FakeAC.Start(fortnitePath, "FortniteLauncher.exe");
 
-                Console.WriteLine("[DEBUG] Server started! PID: " + process.Id);
-                Console.WriteLine("[DEBUG] Backend.dll will be injected on startup, memory.dll and server.dll after login detection...");
+                if (debugMode)
+                {
+                    Console.WriteLine("[DEBUG] Server started! PID: " + process.Id);
+                    Console.WriteLine("[DEBUG] Log file: " + logFile);
+                    Console.WriteLine("[DEBUG] Backend.dll will be injected on startup, memory.dll and server.dll after login detection...");
+                }
 
                 return process.Id;
             }
@@ -448,32 +561,57 @@ class BlackFN
         }
         catch (Exception ex)
         {
-            Console.WriteLine("[DEBUG] Exception in StartFortniteInstance: " + ex);
+            if (debugMode)
+                Console.WriteLine("[DEBUG] Exception in StartFortniteInstance: " + ex);
             return -1;
+        }
+    }
+
+    static async void OnListeningDetected(int processId)
+    {
+        Console.WriteLine($"Server PID {processId} is now listening - starting 70 second wait period...");
+
+        if (instanceSetupStartTime.ContainsKey(processId))
+        {
+            instanceSetupStartTime[processId] = DateTime.Now;
+            instanceSetupComplete[processId] = true;
+            instanceListeningDetected[processId] = true;
+
+            if (debugMode)
+                Console.WriteLine($"[DEBUG] PID {processId} entered 70 second wait period. Scaling checks will resume after.");
         }
     }
 
     static async void OnLoginDetected(int processId)
     {
-        Console.WriteLine($"[DEBUG] Login detected for PID {processId}! Injecting memory.dll and server.dll...");
+        Console.WriteLine($"Login detected for PID {processId} - injecting DLLs...");
 
         try
         {
-            Console.WriteLine($"[DEBUG] Injecting server.dll into PID {processId}...");
+            if (debugMode)
+                Console.WriteLine($"[DEBUG] Injecting server.dll into PID {processId}...");
+
             Injector.Inject(processId, Path.Combine(DllPath, "server.dll"));
-            Console.WriteLine($"[DEBUG] server.dll successfully injected into PID {processId}");
+
+            if (debugMode)
+                Console.WriteLine($"[DEBUG] server.dll successfully injected into PID {processId}");
 
             if (instanceSetupComplete.ContainsKey(processId))
             {
                 instanceSetupComplete[processId] = true;
-                Console.WriteLine($"[DEBUG] Setup completed for PID {processId}. Waiting 70 seconds before next scaling check...");
+
+                if (debugMode)
+                    Console.WriteLine($"[DEBUG] Setup completed for PID {processId}. Waiting 70 seconds before next scaling check...");
             }
 
-            Console.WriteLine($"[DEBUG] All DLLs successfully injected into PID {processId}");
+            Console.WriteLine($"All DLLs successfully injected into PID {processId}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[DEBUG] Error injecting DLLs into PID {processId}: {ex}");
+            Console.WriteLine($"Error injecting DLLs into PID {processId}");
+
+            if (debugMode)
+                Console.WriteLine($"[DEBUG] Error details: {ex}");
         }
     }
 
@@ -483,9 +621,8 @@ class BlackFN
         {
             Console.Clear();
             Console.WriteLine("============================");
-            Console.WriteLine("SERVER STARTER V3");
-            Console.WriteLine($"Running instances: {runningInstances.Count}");
-            Console.WriteLine($"S4Login Proxy: {(s4LoginEnabled ? "Enabled" : "Disabled")}");
+            Console.WriteLine("SERVER STARTER V3.2");
+            Console.WriteLine($"Running instances: {runningInstances.Count}/{maxServerInstances}");
 
             int instancesInSetup = 0;
             foreach (var instance in instanceSetupComplete)
@@ -513,15 +650,19 @@ class BlackFN
 
     static void ShowInstanceStatus()
     {
-        Console.WriteLine("[DEBUG] Showing instance status:");
+        if (debugMode)
+            Console.WriteLine("[DEBUG] Showing instance status:");
+
         for (int i = 0; i < runningInstances.Count; i++)
         {
             int pid = runningInstances[i];
             try
             {
                 var process = Process.GetProcessById(pid);
-                string backendStatus = instanceBackendInjected.ContainsKey(pid) && instanceBackendInjected[pid] ? "Backend.dll ✓" : "Backend.dll ✗";
+                string backendStatus = instanceBackendInjected.ContainsKey(pid) && instanceBackendInjected[pid] ? "Backend ✓" : "Backend ✗";
                 string setupStatus = instanceSetupComplete.ContainsKey(pid) && instanceSetupComplete[pid] ? "Setup ✓" : "Setup ✗";
+                string listeningStatus = instanceListeningDetected.ContainsKey(pid) && instanceListeningDetected[pid] ? "Listening ✓" : "Listening ✗";
+                string logFile = instanceLogFiles.ContainsKey(pid) ? Path.GetFileName(instanceLogFiles[pid]) : "N/A";
 
                 if (instanceSetupStartTime.ContainsKey(pid) && instanceSetupComplete.ContainsKey(pid) && instanceSetupComplete[pid])
                 {
@@ -530,18 +671,18 @@ class BlackFN
                     setupStatus += $" ({timeRemaining}s remaining)";
                 }
 
-                Console.WriteLine($"[DEBUG] PID {pid} is running. {backendStatus} | {setupStatus}");
+                Console.WriteLine($"PID {pid}: {backendStatus} | {setupStatus} | {listeningStatus} | Log: {logFile}");
             }
             catch
             {
-                Console.WriteLine($"[DEBUG] PID {pid} not found.");
+                Console.WriteLine($"PID {pid}: Not found");
             }
         }
     }
 
     static async Task StopAllInstances()
     {
-        Console.WriteLine("[DEBUG] Stopping all instances...");
+        Console.WriteLine("Stopping all instances...");
         shouldMonitor = false;
         cancellationTokenSource.Cancel();
 
@@ -550,32 +691,18 @@ class BlackFN
             try
             {
                 Process.GetProcessById(pid).Kill();
-                Console.WriteLine("[DEBUG] Killed PID " + pid);
+                Console.WriteLine($"Stopped server PID {pid}");
                 CleanupInstance(pid);
             }
             catch (Exception ex)
             {
-                Console.WriteLine("[DEBUG] Exception while stopping PID " + pid + ": " + ex);
+                if (debugMode)
+                    Console.WriteLine("[DEBUG] Exception while stopping PID " + pid + ": " + ex);
             }
         }
 
         runningInstances.Clear();
-        Console.WriteLine("[DEBUG] All instances stopped.");
-
-        if (s4LoginEnabled)
-        {
-            Console.WriteLine("[DEBUG] Stopping S4Login proxy server...");
-            var result = await S4Login.StopServerAsync();
-            if (result.ContainsKey("success") && (bool)result["success"])
-            {
-                Console.WriteLine("[DEBUG] S4Login proxy server stopped successfully.");
-            }
-            else
-            {
-                Console.WriteLine("[DEBUG] Failed to stop S4Login proxy server: " + (result.ContainsKey("error") ? result["error"] : "Unknown error"));
-            }
-            s4LoginEnabled = false;
-        }
+        Console.WriteLine("All instances stopped.");
     }
 
     static async Task Settings()
@@ -594,7 +721,21 @@ class BlackFN
             if (!string.IsNullOrWhiteSpace(apiHost)) break;
         }
 
-        string apiUrl = $"https://{apiHost}";
+        Console.WriteLine("Detecting API URL and port...");
+        string detectedApiUrl = await DetectApiUrlWithPort(apiHost);
+
+        if (detectedApiUrl == null)
+        {
+            Console.WriteLine("Could not connect to API server on any port (3551, 443) with http or https!");
+            Console.WriteLine("Please check if the server is running and accessible.");
+            Console.WriteLine("Press any key to try again...");
+            Console.ReadKey();
+            await Settings();
+            return;
+        }
+
+        string apiUrl = detectedApiUrl;
+        Console.WriteLine($"Successfully connected to API at: {apiUrl}");
 
         string secretToken;
         while (true)
@@ -614,57 +755,28 @@ class BlackFN
             Console.WriteLine("Invalid path!");
         }
 
-        string useS4Login;
-        bool s4Enabled = false;
+        int maxServers;
         while (true)
         {
-            Console.Write("Use S4Login Proxy? (yes/no): ");
-            useS4Login = Console.ReadLine()?.ToLower();
-            if (useS4Login == "yes" || useS4Login == "y")
-            {
-                s4Enabled = true;
-
-                string paksPath = Path.Combine(fortnitePath, "FortniteGame", "Content", "Paks");
-                string loginFixPak = Path.Combine(paksPath, "pakchunkLoginFix-WindowsClient.pak");
-                string loginFixSig = Path.Combine(paksPath, "pakchunkLoginFix-WindowsClient.sig");
-
-                if (!File.Exists(loginFixPak) || !File.Exists(loginFixSig))
-                {
-                    Console.WriteLine("[WARNING] S4Login enabled but LoginFix files not found!");
-                    Console.WriteLine($"[WARNING] pak location: {loginFixPak}");
-                    Console.WriteLine($"[WARNING] sig location: {loginFixSig}");
-                    Console.Write("Continue anyway? (yes/no): ");
-                    string continueAnyway = Console.ReadLine()?.ToLower();
-                    if (continueAnyway != "yes" && continueAnyway != "y")
-                    {
-                        Console.WriteLine("Please add the LoginFix files and try again.");
-                        continue;
-                    }
-                }
-                else
-                {
-                    Console.WriteLine("[SUCCESS] LoginFix pak and sig files found!");
-                }
+            Console.Write("Enter maximum server instances (1-75): ");
+            if (int.TryParse(Console.ReadLine(), out maxServers) && maxServers >= 1 && maxServers <= 75)
                 break;
-            }
-            else if (useS4Login == "no" || useS4Login == "n")
-            {
-                s4Enabled = false;
-                break;
-            }
-            Console.WriteLine("Please enter 'yes' or 'no'");
+            Console.WriteLine("Please enter a number between 1 and 75!");
         }
 
-        File.WriteAllLines(filePath, new[] { apiUrl, secretToken, fortnitePath, s4Enabled.ToString() });
+        File.WriteAllLines(filePath, new[] { apiUrl, secretToken, fortnitePath });
+        File.WriteAllText(configPath, maxServers.ToString());
 
-        File.WriteAllText(configPath, $"UseS4Login={s4Enabled}");
+        Console.WriteLine("Settings saved successfully!");
 
-        Console.WriteLine("[DEBUG] Settings saved to " + filePath);
-        Console.WriteLine("[DEBUG] Config saved to " + configPath);
-        Console.WriteLine($"[DEBUG] Saved - API URL: {apiUrl}");
-        Console.WriteLine($"[DEBUG] Saved - Secret Token: {secretToken}");
-        Console.WriteLine($"[DEBUG] Saved - Fortnite Path: {fortnitePath}");
-        Console.WriteLine($"[DEBUG] Saved - S4Login Enabled: {s4Enabled}");
+        if (debugMode)
+        {
+            Console.WriteLine("[DEBUG] Settings saved to " + filePath);
+            Console.WriteLine($"[DEBUG] Saved - API URL: {apiUrl}");
+            Console.WriteLine($"[DEBUG] Saved - Secret Token: {secretToken}");
+            Console.WriteLine($"[DEBUG] Saved - Fortnite Path: {fortnitePath}");
+            Console.WriteLine($"[DEBUG] Saved - Max Instances: {maxServers}");
+        }
 
         await StartMenu();
     }
@@ -676,12 +788,20 @@ public class ProcessOutputHandler
     private Thread _outputThread;
     private Thread _errorThread;
     private bool _isRunning;
+    private string _logFilePath;
+    private StreamWriter _logWriter;
+    private object _logLock = new object();
+    private bool _debugMode;
 
     public event EventHandler LoginDetected;
+    public event EventHandler ListeningDetected;
 
-    public ProcessOutputHandler(Process process)
+    public ProcessOutputHandler(Process process, string logFilePath, bool debugMode = false)
     {
         _process = process;
+        _logFilePath = logFilePath;
+        _debugMode = debugMode;
+        _logWriter = new StreamWriter(_logFilePath, true) { AutoFlush = true };
     }
 
     public void Start()
@@ -700,6 +820,16 @@ public class ProcessOutputHandler
     public void Stop()
     {
         _isRunning = false;
+
+        lock (_logLock)
+        {
+            if (_logWriter != null)
+            {
+                _logWriter.Close();
+                _logWriter.Dispose();
+                _logWriter = null;
+            }
+        }
     }
 
     private void ReadOutput()
@@ -746,12 +876,23 @@ public class ProcessOutputHandler
 
         if (line.Contains("Successfully logged in user"))
         {
-            Console.WriteLine($"[{timestamp}] [GAME] Login detected");
+            if (_debugMode)
+                Console.WriteLine($"[{timestamp}] [GAME] Login detected");
             LoginDetected?.Invoke(this, EventArgs.Empty);
         }
-        else
+        else if (line.Contains("Listening on port"))
         {
-            Console.WriteLine($"[GAME OUTPUT] {line}");
+            if (_debugMode)
+                Console.WriteLine($"[{timestamp}] [GAME] Listening on port detected");
+            ListeningDetected?.Invoke(this, EventArgs.Empty);
+        }
+
+        lock (_logLock)
+        {
+            if (_logWriter != null)
+            {
+                _logWriter.WriteLine($"[{timestamp}] {line}");
+            }
         }
     }
 }
